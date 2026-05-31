@@ -19,7 +19,17 @@ Ruixiang Zhang\*, Richard He Bai\*, Huangjie Zheng\*, Navdeep Jaitly, Ronan Coll
 
 ## ✨ Overview
 
-This repository reproduces the method from the paper:
+This fork is an experimental Apple Silicon / MLX port of the original
+[`apple/ml-ssd`](https://github.com/apple/ml-ssd) repository. The goal is to
+reproduce the Simple Self-Distillation workflow locally with
+[`mlx-lm`](https://github.com/ml-explore/mlx-lm) instead of vLLM.
+
+This work is in an early validation phase. The data-generation and evaluation
+paths have been migrated to MLX-LM and basic smoke tests pass, but benchmark
+numbers should be treated as experimental until the generation, fine-tuning, and
+evaluation setup has been validated end to end against the published settings.
+
+The upstream repository reproduces the method from the paper:
 
 > **Embarrassingly Simple Self-Distillation Improves Code Generation**
 
@@ -37,6 +47,7 @@ For full details, see the [paper](https://arxiv.org/abs/2604.01193).
 
 ## 📰 News
 
+- **[2026-05-31]** Experimental MLX-LM migration branch for local Apple Silicon runs
 - **[2026-04-03]** 🚀 Initial release of repository  
 - **[2026-04-03]** 🤗 Model checkpoints coming soon on Hugging Face
 - **[2026-04-07]** 🤗 Model checkpoints released
@@ -48,12 +59,16 @@ For full details, see the [paper](https://arxiv.org/abs/2604.01193).
 ## 🚀 Getting Started
 
 ```bash
-git clone https://github.com/apple/ml-ssd.git
-cd ml-ssd
+git clone https://github.com/ivanfioravanti/ml-ssd-mlx.git
+cd ml-ssd-mlx
 uv sync --group evaluation          # for evaluation only
 uv sync --group data-generation     # for data generation only
 uv sync --group evaluation --group data-generation  # for both
 ```
+
+This MLX version runs inference with `mlx-lm` on Apple Silicon. The upstream
+`apple/ml-ssd` repository remains the source of truth for the original vLLM
+workflow and published results.
 
 <details>
 <summary>Evaluation commands</summary>
@@ -61,15 +76,18 @@ uv sync --group evaluation --group data-generation  # for both
 ```bash
 source .venv/bin/activate
 python evaluation/eval.py \
-    --model <hf_model_name> \
-    --tensor_parallel_size 4 \
+    --model mlx-community/Qwen3-4B-Instruct-2507-8bit \
     --max_tokens 65536 \
-    --n_repeat 10 \
-    --sampling_params "temperature=0.9,top_p=0.8,top_k=20" \
+    --n_repeat 20 \
+    --sampling_params "temperature=1.1,top_p=0.8,top_k=20,min_p=0.0" \
+    --completion_batch_size 4 \
+    --prefill_batch_size 2 \
     --output_path ./results/
 ```
 
-> **Note:** The sampling parameters above are illustrative. Please refer to each model's HuggingFace model card for the recommended sampling parameters.
+For quick validation, add `--limit 1` or `--limit 5` and reduce
+`--max_tokens`. Full benchmark-style runs should remove `--limit` and use the
+sampling parameters from the model card.
 
 </details>
 
@@ -81,7 +99,27 @@ source .venv/bin/activate
 python data_generation/generate.py --config data_generation/config.yaml
 ```
 
-This runs the full pipeline end-to-end: loads the dataset, generates solutions with vLLM, and post-processes into chat-template JSONL for SFT training. Edit `data_generation/config.yaml` to change the model, dataset, sampling temperature, etc.
+This runs the full pipeline end-to-end: loads the dataset, generates solutions with MLX-LM, and post-processes into chat-template JSONL for SFT training. Edit `data_generation/config.yaml` to change the model, dataset, sampling temperature, batch sizes, etc.
+
+The current data-generation config follows the SimpleSD-4B-instruct
+self-distillation settings: `temperature=1.6`, `top_p=0.8`, `top_k=20`. For
+faster local experiments, an MLX-converted model such as
+`mlx-community/Qwen3-4B-Instruct-2507-8bit` can be passed with `--model-name`.
+
+</details>
+
+<details>
+<summary>Current experimental status</summary>
+
+- Replaced vLLM dependencies with `mlx-lm`.
+- Added an MLX text-generation adapter shared by evaluation and data generation.
+- Kept `datasets==3.6.0` because LiveCodeBench v6 is still script-backed and
+  cannot be loaded by `datasets` 4.x.
+- Added `--limit` to evaluation for smoke tests and short validation runs.
+- Fine-tuning is not fully integrated into this repo yet. Generated JSONL can be
+  used with `mlx_lm lora` or another local training setup, but evaluating a
+  locally trained SimpleSD adapter still needs adapter-loading support in the
+  evaluation CLI.
 
 </details>
 
@@ -102,6 +140,7 @@ This runs the full pipeline end-to-end: loads the dataset, generates solutions w
 ├── evaluation/
 │   ├── eval.py                  # CLI entry point
 │   ├── benchmark.py             # LiveCodeBench v6 implementation
+│   ├── mlx_generation.py        # MLX-LM generation adapter
 │   └── livecodebench_utils.py   # Code execution utilities
 ├── figures/
 │   └── fig_teaser.png
