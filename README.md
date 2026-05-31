@@ -47,11 +47,11 @@ For full details, see the [paper](https://arxiv.org/abs/2604.01193).
 
 ## 📰 News
 
-- **[2026-05-31]** Experimental MLX-LM migration branch for local Apple Silicon runs
 - **[2026-04-03]** 🚀 Initial release of repository  
 - **[2026-04-03]** 🤗 Model checkpoints coming soon on Hugging Face
 - **[2026-04-07]** 🤗 Model checkpoints released
 - **[2026-04-16]** 🔧 Data generation pipeline released
+- **[2026-05-31]** Experimental MLX-LM migration branch for local Apple Silicon runs
 - *(More updates will be added here)*
 
 ---
