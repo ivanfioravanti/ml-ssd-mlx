@@ -12,8 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 from datasets import Dataset, concatenate_datasets, load_dataset
-from vllm import SamplingParams
 
+from evaluation.mlx_generation import MLXGenerationConfig
 from evaluation.livecodebench_utils import (
     compute_metrics_from_results,
     lcb_run,
@@ -60,17 +60,23 @@ class LiveCodeBenchV6:
 
     def __init__(
         self,
-        llm,
+        generator,
         tokenizer,
         max_tokens: int = 32768,
         n_repeat: int = 20,
+        limit: int = 0,
         sampling_params: Optional[Dict[str, Any]] = None,
         seed: Optional[List[int]] = None,
+        completion_batch_size: int = 32,
+        prefill_batch_size: int = 8,
+        prefill_step_size: int = 2048,
+        max_kv_size: Optional[int] = None,
     ):
-        self.llm = llm
+        self.generator = generator
         self.tokenizer = tokenizer
         self.max_tokens = max_tokens
         self.n_repeat = n_repeat
+        self.limit = limit
         self.sampling_params = sampling_params if sampling_params is not None else {
             "temperature": 0.6,
             "top_p": 0.95,
@@ -78,20 +84,26 @@ class LiveCodeBenchV6:
             "min_p": 0.0,
         }
         self.seed = seed if seed is not None else [0, 1234, 1234, 1234]
+        self.completion_batch_size = completion_batch_size
+        self.prefill_batch_size = prefill_batch_size
+        self.prefill_step_size = prefill_step_size
+        self.max_kv_size = max_kv_size
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def run(self):
         """Run the full benchmark: load data, generate solutions, evaluate."""
         ds = self.load_questions()
         examples = list(ds)
+        if self.limit > 0:
+            examples = examples[: self.limit]
+            self.logger.info(f"Limited evaluation to {len(examples)} problems")
         self.generate(examples)
         results = self.evaluate(examples)
         return results
 
     def generate(self, examples):
-        """Generate solution completions using vLLM."""
+        """Generate solution completions using MLX-LM."""
         all_outputs = []
-        stop_token_ids = [self.tokenizer.eos_token_id] if self.tokenizer.eos_token_id is not None else []
 
         for i in range(self.n_repeat):
             seed = self.seed[0] + i
@@ -110,20 +122,22 @@ class LiveCodeBenchV6:
 
                 messages = [{"role": "user", "content": prompt_text}]
                 templated = self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+                    messages, tokenize=True, add_generation_prompt=True
                 )
-                prompts.append(templated)
+                prompts.append(templated.tolist() if hasattr(templated, "tolist") else templated)
 
-            sampling_params = SamplingParams(
+            generation_config = MLXGenerationConfig.from_sampling_params(
+                self.sampling_params,
                 max_tokens=self.max_tokens,
                 seed=seed,
-                stop_token_ids=stop_token_ids,
-                **self.sampling_params,
+                completion_batch_size=self.completion_batch_size,
+                prefill_batch_size=self.prefill_batch_size,
+                prefill_step_size=self.prefill_step_size,
+                max_kv_size=self.max_kv_size,
             )
 
             self.logger.info(f"Generating responses (repeat {i + 1}/{self.n_repeat})...")
-            outputs = self.llm.generate(prompts, sampling_params)
-            texts = [o.outputs[0].text for o in outputs]
+            texts = self.generator.generate(prompts, generation_config)
             all_outputs.append(texts)
 
         for example, per_example_outputs in zip(examples, zip(*all_outputs)):

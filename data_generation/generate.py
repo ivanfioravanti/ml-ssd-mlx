@@ -15,7 +15,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 from datasets import load_dataset
-from vllm import LLM, SamplingParams
+
+from evaluation.mlx_generation import MLXGenerationConfig, MLXTextGenerator
 
 # =============================================================================
 # Data Loading
@@ -67,8 +68,7 @@ def generate(config: Dict[str, Any], template_dir: str, limit: int = 0):
 
     # Extract config
     model_name = config['model']['name']
-    tp_size = config['model'].get('tensor_parallel_size', 4)
-    gpu_mem = config['model'].get('gpu_memory_utilization', 0.85)
+    trust_remote_code = config['model'].get('trust_remote_code', True)
 
     dataset_name = config['dataset']['name']
     dataset_config = config['dataset']['config']
@@ -79,8 +79,17 @@ def generate(config: Dict[str, Any], template_dir: str, limit: int = 0):
     temperature = config['generation'].get('temperature', 1.6)
     top_k = config['generation'].get('top_k', 20)
     top_p = config['generation'].get('top_p', 0.8)
+    min_p = config['generation'].get('min_p', 0.0)
     repetition_penalty = config['generation'].get('repetition_penalty', 1.0)
+    repetition_context_size = config['generation'].get('repetition_context_size', 20)
     max_tokens = config['generation'].get('max_tokens', 65536)
+    stop = config['generation'].get('stop', ["<|im_end|>", "<|endoftext|>"])
+
+    batch_config = config.get('batch', {})
+    completion_batch_size = batch_config.get('completion_batch_size', 32)
+    prefill_batch_size = batch_config.get('prefill_batch_size', 8)
+    prefill_step_size = batch_config.get('prefill_step_size', 2048)
+    max_kv_size = batch_config.get('max_kv_size')
 
     filter_percent = config.get('post_process', {}).get('filter_shortest_percent', 10.0)
 
@@ -88,7 +97,9 @@ def generate(config: Dict[str, Any], template_dir: str, limit: int = 0):
     print(f"Dataset: {dataset_name}/{dataset_config} (split: {dataset_split})")
     print(f"Output: {output_dir}")
     print(f"Generation: temp={temperature}, top_k={top_k}, top_p={top_p}, "
-          f"rep_penalty={repetition_penalty}, max_tokens={max_tokens}")
+          f"min_p={min_p}, rep_penalty={repetition_penalty}, max_tokens={max_tokens}")
+    print(f"MLX batch: completion={completion_batch_size}, prefill={prefill_batch_size}, "
+          f"prefill_step={prefill_step_size}, max_kv_size={max_kv_size}")
     print("-" * 60)
 
     # Load templates
@@ -127,34 +138,31 @@ def generate(config: Dict[str, Any], template_dir: str, limit: int = 0):
     print("STAGE 1: Generate solutions")
     stage1_start = time.time()
 
-    print(f"Initializing vLLM (model: {model_name}, TP={tp_size})...")
-    llm = LLM(
-        model=model_name,
-        tensor_parallel_size=tp_size,
-        gpu_memory_utilization=gpu_mem,
-        max_model_len=max_tokens,
-        dtype="bfloat16",
-        trust_remote_code=True,
-        enforce_eager=False,
-    )
+    print(f"Initializing MLX-LM (model: {model_name})...")
+    generator = MLXTextGenerator(model_name, trust_remote_code=trust_remote_code)
 
     print(f"Generating solutions for {len(examples)} examples...")
 
-    sampling_params = SamplingParams(
+    generation_config = MLXGenerationConfig(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
+        min_p=min_p,
         repetition_penalty=repetition_penalty,
+        repetition_context_size=repetition_context_size,
         max_tokens=max_tokens,
-        skip_special_tokens=True,
-        stop=["<|im_end|>", "<|endoftext|>"],
+        stop=stop,
+        completion_batch_size=completion_batch_size,
+        prefill_batch_size=prefill_batch_size,
+        prefill_step_size=prefill_step_size,
+        max_kv_size=max_kv_size,
     )
 
     prompts = [ex['prompt'] for ex in examples]
-    outputs = llm.generate(prompts=prompts, sampling_params=sampling_params, use_tqdm=True)
+    outputs = generator.generate(prompts, generation_config, verbose=True)
 
     for ex, output in zip(examples, outputs):
-        ex['output'] = output.outputs[0].text.strip()
+        ex['output'] = output
 
     print(f"STAGE 1 complete: {len(examples)} generated in {time.time() - stage1_start:.1f}s")
 
@@ -236,7 +244,7 @@ def generate(config: Dict[str, Any], template_dir: str, limit: int = 0):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate solutions for coding problems using vLLM")
+    parser = argparse.ArgumentParser(description="Generate solutions for coding problems using MLX-LM")
     parser.add_argument("--config", required=True, help="Path to config YAML file")
     parser.add_argument("--temperature", type=float, help="Override generation temperature")
     parser.add_argument("--model-name", type=str, help="Override model name")

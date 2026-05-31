@@ -2,8 +2,7 @@
 
 model:
   name: "Qwen/Qwen3-4B-Instruct-2507"
-  tensor_parallel_size: 1
-  gpu_memory_utilization: 0.85
+  trust_remote_code: true
 
 dataset:
   name: "microsoft/rStar-Coder"
@@ -14,11 +13,22 @@ output:
   path: "./output"
 
 generation:
-  temperature: 1.5
+  temperature: 1.6
   top_k: 20
   top_p: 0.8
+  min_p: 0.0
   repetition_penalty: 1.0
+  repetition_context_size: 20
   max_tokens: 65536
+  stop:
+    - "<|im_end|>"
+    - "<|endoftext|>"
+
+batch:
+  completion_batch_size: 32
+  prefill_batch_size: 8
+  prefill_step_size: 2048
+  max_kv_size:
 
 post_process:
   filter_shortest_percent: 10     # Drop bottom 10% shortest responses
