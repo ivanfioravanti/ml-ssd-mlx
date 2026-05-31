@@ -1,4 +1,4 @@
-# Simple Self-Distillation
+# Simple Self-Distillation with MLX 
 <div align="center">
 
 [![arXiv](https://img.shields.io/badge/arXiv-2604.01193-b31b1b.svg)](https://arxiv.org/abs/2604.01193)
