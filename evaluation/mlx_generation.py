@@ -5,11 +5,14 @@
 
 """Small MLX-LM adapter used by data generation and evaluation."""
 
+import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import mlx.core as mx
 from mlx_lm import batch_generate, load
+from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
 Prompt = Union[str, Sequence[int]]
@@ -32,6 +35,16 @@ class MLXGenerationConfig:
     prefill_batch_size: int = 8
     prefill_step_size: int = 2048
     max_kv_size: Optional[int] = None
+    loop_ngram_min: int = 0
+    loop_ngram_max: int = 0
+    loop_repetitions: int = 0
+    loop_min_tokens: int = 0
+    loop_check_interval: int = 128
+    loop_text_window_tokens: int = 2048
+    loop_text_ngram_min: int = 5
+    loop_text_ngram_max: int = 12
+    loop_text_repetitions: int = 20
+    loop_max_code_fences: int = 0
 
     @classmethod
     def from_sampling_params(
@@ -56,6 +69,7 @@ class MLXTextGenerator:
             path_or_hf_repo=model_name,
             tokenizer_config={"trust_remote_code": trust_remote_code},
         )
+        self.last_finish_reasons: List[str] = []
 
     def generate(
         self,
@@ -84,12 +98,45 @@ class MLXTextGenerator:
             repetition_context_size=config.repetition_context_size,
         )
 
-        response = batch_generate(
+        if self._loop_detection_enabled(config):
+            texts = self._generate_with_loop_detection(
+                token_prompts,
+                config,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                verbose=verbose,
+            )
+        else:
+            response = batch_generate(
+                self.model,
+                self.tokenizer,
+                token_prompts,
+                max_tokens=config.max_tokens,
+                verbose=verbose,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                completion_batch_size=config.completion_batch_size,
+                prefill_batch_size=config.prefill_batch_size,
+                prefill_step_size=config.prefill_step_size,
+                max_kv_size=config.max_kv_size,
+            )
+            texts = response.texts
+            self.last_finish_reasons = ["unknown"] * len(texts)
+
+        return [self._strip_stop_text(text, config.stop).strip() for text in texts]
+
+    def _generate_with_loop_detection(
+        self,
+        token_prompts: Sequence[List[int]],
+        config: MLXGenerationConfig,
+        *,
+        sampler: Any,
+        logits_processors: Any,
+        verbose: bool,
+    ) -> List[str]:
+        gen = BatchGenerator(
             self.model,
-            self.tokenizer,
-            token_prompts,
-            max_tokens=config.max_tokens,
-            verbose=verbose,
+            stop_tokens=[[token] for token in self.tokenizer.eos_token_ids],
             sampler=sampler,
             logits_processors=logits_processors,
             completion_batch_size=config.completion_batch_size,
@@ -97,7 +144,128 @@ class MLXTextGenerator:
             prefill_step_size=config.prefill_step_size,
             max_kv_size=config.max_kv_size,
         )
-        return [self._strip_stop_text(text, config.stop).strip() for text in response.texts]
+
+        num_samples = len(token_prompts)
+        if verbose:
+            print(f"[batch_generate] Finished processing 0/{num_samples} ...", end="\r")
+
+        uids = gen.insert(
+            list(token_prompts),
+            [config.max_tokens] * len(token_prompts),
+        )
+        results = {uid: [] for uid in uids}
+        finish_reasons = {uid: "" for uid in uids}
+        finished = 0
+
+        with gen.stats() as stats:
+            while responses := gen.next_generated():
+                loop_uids = []
+                for response in responses:
+                    if response.finish_reason != "stop":
+                        results[response.uid].append(response.token)
+
+                    if response.finish_reason is not None:
+                        finish_reasons[response.uid] = response.finish_reason
+                        finished += 1
+                        if verbose:
+                            print(
+                                f"[batch_generate] Finished processing {finished}/{num_samples} ...",
+                                end="\r",
+                            )
+                    elif self._has_repeated_tail(results[response.uid], config):
+                        finish_reasons[response.uid] = "loop"
+                        loop_uids.append(response.uid)
+
+                if loop_uids:
+                    gen.remove(loop_uids)
+                    for _ in loop_uids:
+                        finished += 1
+                        if verbose:
+                            print(
+                                f"[batch_generate] Finished processing {finished}/{num_samples} ...",
+                                end="\r",
+                            )
+
+        gen.close()
+
+        if verbose:
+            print(f"[batch_generate] Finished processing {finished}/{num_samples}")
+            loop_count = sum(reason == "loop" for reason in finish_reasons.values())
+            if loop_count:
+                print(f"[batch_generate] Loop-stopped: {loop_count}/{num_samples}")
+            print(
+                f"[batch_generate] Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"
+            )
+            print(
+                f"[batch_generate] Generation: {stats.generation_tokens} tokens, "
+                f"{stats.generation_tps:.3f} tokens-per-sec"
+            )
+            print(f"[batch_generate] Peak memory: {stats.peak_memory:.3f} GB")
+
+        self.last_finish_reasons = [finish_reasons[uid] or "unknown" for uid in uids]
+        return [self.tokenizer.decode(results[uid]) for uid in uids]
+
+    @staticmethod
+    def _loop_detection_enabled(config: MLXGenerationConfig) -> bool:
+        return (
+            config.loop_ngram_min > 0
+            and config.loop_ngram_max >= config.loop_ngram_min
+            and config.loop_repetitions > 1
+        )
+
+    def _has_repeated_tail(self, tokens: Sequence[int], config: MLXGenerationConfig) -> bool:
+        if len(tokens) < max(config.loop_min_tokens, config.loop_ngram_min * config.loop_repetitions):
+            return False
+
+        max_ngram = min(config.loop_ngram_max, len(tokens) // config.loop_repetitions)
+        for ngram_size in range(config.loop_ngram_min, max_ngram + 1):
+            tail = tokens[-ngram_size:]
+            repeated = True
+            for repetition in range(2, config.loop_repetitions + 1):
+                start = -repetition * ngram_size
+                end = -(repetition - 1) * ngram_size
+                if list(tokens[start:end]) != tail:
+                    repeated = False
+                    break
+            if repeated:
+                return True
+
+        if config.loop_check_interval <= 0 or len(tokens) % config.loop_check_interval != 0:
+            return False
+
+        return self._has_repeated_text_tail(tokens, config)
+
+    def _has_repeated_text_tail(
+        self,
+        tokens: Sequence[int],
+        config: MLXGenerationConfig,
+    ) -> bool:
+        window_tokens = tokens[-config.loop_text_window_tokens :]
+        if not window_tokens:
+            return False
+
+        if config.loop_max_code_fences > 0:
+            text = self.tokenizer.decode(tokens)
+            if text.count("```") >= config.loop_max_code_fences:
+                return True
+            text = self.tokenizer.decode(window_tokens)
+        else:
+            text = self.tokenizer.decode(window_tokens)
+        words = re.findall(r"[A-Za-z_][A-Za-z_0-9]*|\S", text.lower())
+        min_required = config.loop_text_ngram_max + config.loop_text_repetitions
+        if len(words) < min_required:
+            return False
+
+        max_ngram = min(config.loop_text_ngram_max, len(words))
+        for ngram_size in range(config.loop_text_ngram_min, max_ngram + 1):
+            ngrams = (
+                tuple(words[i : i + ngram_size])
+                for i in range(len(words) - ngram_size + 1)
+            )
+            if Counter(ngrams).most_common(1)[0][1] >= config.loop_text_repetitions:
+                return True
+
+        return False
 
     def _encode_prompt(self, prompt: Prompt) -> List[int]:
         if isinstance(prompt, str):

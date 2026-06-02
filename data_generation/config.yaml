@@ -1,7 +1,7 @@
-# Data Generation Configuration
+# Data Generation Configuration (paper-aligned defaults)
 
 model:
-  name: "Qwen/Qwen3-4B-Instruct-2507"
+  name: "mlx-community/Qwen3-4B-Instruct-2507-bf16"
   trust_remote_code: true
 
 dataset:
@@ -9,11 +9,20 @@ dataset:
   config: "seed_sft"
   split: "train"
 
+# Paper §3.1: ~10K deduplicated prompts, one sample each (N=1).
+# On public seed_sft: is_passed + unique question_id ≈ 10,168 prompts.
+prompt_selection:
+  mode: paper              # paper | full
+  deduplicate_by: question_id
+  filter_is_passed: true
+  prefer_passed_row: true
+  max_prompts: 0           # 0 = no cap; set 10000 to hard-cap at exactly 10K
+
 output:
   path: "./output"
 
 generation:
-  temperature: 1.6
+  temperature: 1.6         # Table 3, Qwen3-4B-Instruct T_train
   top_k: 20
   top_p: 0.8
   min_p: 0.0
@@ -23,12 +32,25 @@ generation:
   stop:
     - "<|im_end|>"
     - "<|endoftext|>"
+  loop_detection:
+    ngram_min: 8
+    ngram_max: 128
+    repetitions: 4
+    min_tokens: 4096
+    check_interval: 512
+    text_window_tokens: 4096
+    text_ngram_min: 5
+    text_ngram_max: 12
+    text_repetitions: 50
+    max_code_fences: 4
 
 batch:
-  completion_batch_size: 32
-  prefill_batch_size: 8
+  completion_batch_size: 4
+  prefill_batch_size: 4
   prefill_step_size: 2048
   max_kv_size:
 
 post_process:
-  filter_shortest_percent: 10     # Drop bottom 10% shortest responses
+  filter_shortest_percent: 0      # Paper uses minimal syntactic filter only
+  minimal_syntactic_filter: true  # Drop empty responses and single-line stubs
+  stub_max_chars: 80
