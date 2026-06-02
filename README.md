@@ -101,6 +101,11 @@ python data_generation/generate.py --config data_generation/config.yaml
 
 This runs the full pipeline end-to-end: loads the dataset, generates solutions with MLX-LM, and post-processes into chat-template JSONL for SFT training. Edit `data_generation/config.yaml` to change the model, dataset, sampling temperature, batch sizes, etc.
 
+By default, `prompt_selection.mode: paper` selects **~10K unique prompts** from
+`seed_sft` (dedupe by `question_id`, `filter_is_passed: true` — matching the
+paper’s scale on the public Hugging Face split). Use `--no-paper-prompts` for
+the full 591K-row split, or `--limit 20` for smoke tests on the paper set.
+
 The current data-generation config follows the SimpleSD-4B-instruct
 self-distillation settings: `temperature=1.6`, `top_p=0.8`, `top_k=20`. For
 faster local experiments, an MLX-converted model such as
