@@ -106,10 +106,140 @@ By default, `prompt_selection.mode: paper` selects **~10K unique prompts** from
 paper’s scale on the public Hugging Face split). Use `--no-paper-prompts` for
 the full 591K-row split, or `--limit 20` for smoke tests on the paper set.
 
+Long generation runs write resumable parquet checkpoints every 100 examples by
+default. If a run is interrupted, restart it with the same `--output-path` and
+`--resume`; completed checkpoint parts are skipped and the final
+`train.parquet` / `train.jsonl` files are rebuilt after all parts are present.
+If checkpoint parts already exist and you only need to rebuild the final files,
+use `--merge-checkpoints`.
+
+For V1 distributed data-parallel generation, run one shard per machine with the
+same `--distributed-run-id`, `--distributed-output-root`, and
+`--distributed-num-shards`, changing only `--distributed-shard-index`. A
+single-machine distributed run is also valid with `--distributed-num-shards 1`
+and `--distributed-shard-index 0`.
+
+Choose `--distributed-num-shards` before starting the run and keep it fixed for
+that `--distributed-run-id`. A run started with `--distributed-num-shards 1`
+owns the full prompt set and cannot be expanded by adding another machine later;
+stop it and restart all workers with a larger shard count if you want to scale
+out.
+
+```bash
+python data_generation/generate.py \
+    --config data_generation/config.yaml \
+    --distributed-output-root ./output \
+    --distributed-run-id qwen3-4b-ssd-full-10k-b12 \
+    --distributed-num-shards 4 \
+    --distributed-shard-index 0 \
+    --resume
+```
+
+After all shard workers finish, merge them:
+
+```bash
+python data_generation/generate.py \
+    --config data_generation/config.yaml \
+    --distributed-output-root ./output \
+    --distributed-run-id qwen3-4b-ssd-full-10k-b12 \
+    --distributed-num-shards 4 \
+    --distributed-merge
+```
+
+The `--distributed-*` options above are V1 data-parallel sharding: each worker
+loads the full model and owns a disjoint prompt subset.
+
+For the experimental V2 MLX distributed model-parallel path, use JACCL over
+Thunderbolt/RDMA. Start with the probe script before using it in SSD generation.
+The script validates MLX collectives and can optionally load Qwen3 through
+`mlx_lm.utils.sharded_load`.
+
+Create a JACCL hostfile:
+
+```bash
+uv run mlx.distributed_config --verbose --backend jaccl \
+    --hosts mac-1,mac-2 \
+    --over thunderbolt \
+    --auto-setup \
+    --output hosts-jaccl.json
+```
+
+Run the JACCL transport smoke test:
+
+```bash
+PROJECT_DIR=/Users/ifioravanti/github/ml-ssd-mlx
+uv run mlx.launch --verbose --backend jaccl --hostfile hosts-jaccl.json \
+    --cwd "$PROJECT_DIR" \
+    --python "$PROJECT_DIR/.venv/bin/python" \
+    -- "$PROJECT_DIR/scripts/mlx_distributed_probe.py" \
+    --backend jaccl
+```
+
+Optional sharded model-load smoke test:
+
+```bash
+PROJECT_DIR=/Users/ifioravanti/github/ml-ssd-mlx
+uv run mlx.launch --verbose --backend jaccl --hostfile hosts-jaccl.json \
+    --cwd "$PROJECT_DIR" \
+    --python "$PROJECT_DIR/.venv/bin/python" \
+    -- "$PROJECT_DIR/scripts/mlx_distributed_probe.py" \
+    --backend jaccl \
+    --model mlx-community/Qwen3-4B-Instruct-2507-bf16 \
+    --max-tokens 32
+```
+
+Run a JACCL SSD generation smoke test:
+
+```bash
+PROJECT_DIR=/Users/ifioravanti/github/ml-ssd-mlx
+uv run mlx.launch --verbose --backend jaccl --hostfile hosts-jaccl.json \
+    --cwd "$PROJECT_DIR" \
+    --python "$PROJECT_DIR/.venv/bin/python" \
+    -- "$PROJECT_DIR/data_generation/generate.py" \
+    --config "$PROJECT_DIR/data_generation/config.yaml" \
+    --mlx-distributed \
+    --limit 1 \
+    --max-tokens 32 \
+    --checkpoint-every 0 \
+    --output-path "$PROJECT_DIR/output/qwen3-4b-jaccl-generation-smoke"
+```
+
+Run a JACCL evaluation smoke test:
+
+```bash
+PROJECT_DIR=/Users/ifioravanti/github/ml-ssd-mlx
+uv run mlx.launch --verbose --backend jaccl --hostfile hosts-jaccl.json \
+    --cwd "$PROJECT_DIR" \
+    --python "$PROJECT_DIR/.venv/bin/python" \
+    -- "$PROJECT_DIR/evaluation/eval.py" \
+    --model mlx-community/Qwen3.5-0.8B-MLX-4bit \
+    --mlx_distributed \
+    --limit 1 \
+    --n_repeat 1 \
+    --max_tokens 8 \
+    --completion_batch_size 1 \
+    --prefill_batch_size 1 \
+    --lcb_data_files test.jsonl \
+    --lcb_allow_any_date \
+    --lcb_preprocess_num_proc 1 \
+    --output_path "$PROJECT_DIR/results/jaccl-eval-smoke"
+```
+
+Every host in `hosts-jaccl.json` must have the repo and `.venv` at
+`$PROJECT_DIR`. If one host is missing it, sync the checkout there and run
+`uv sync --group evaluation --group data-generation` on that host before
+launching.
+
+All JACCL ranks participate in generation. Rank 0 writes checkpoints, parquet,
+JSONL, evaluation results, and metadata; the first host in `hosts-jaccl.json`
+therefore controls where output files appear.
+
 The current data-generation config follows the SimpleSD-4B-instruct
-self-distillation settings: `temperature=1.6`, `top_p=0.8`, `top_k=20`. For
-faster local experiments, an MLX-converted model such as
-`mlx-community/Qwen3-4B-Instruct-2507-8bit` can be passed with `--model-name`.
+self-distillation settings: `temperature=1.6`, `top_p=0.8`, `top_k=20`, with
+the current best local MLX batch setting `completion_batch_size=12` and
+`prefill_batch_size=12`. For faster local experiments, an MLX-converted model
+such as `mlx-community/Qwen3-4B-Instruct-2507-8bit` can be passed with
+`--model-name`.
 
 </details>
 

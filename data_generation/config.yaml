@@ -45,10 +45,18 @@ generation:
     max_code_fences: 4
 
 batch:
-  completion_batch_size: 4
-  prefill_batch_size: 4
+  completion_batch_size: 12
+  prefill_batch_size: 12
   prefill_step_size: 2048
   max_kv_size:
+
+checkpoint:
+  every: 100                  # Save parquet checkpoints during long generation runs
+  resume: false               # Set true or pass --resume to continue an interrupted run
+
+mlx_distributed:
+  enabled: false              # Set true only when launched with mlx.launch + JACCL hostfile
+  backend: jaccl
 
 post_process:
   filter_shortest_percent: 0      # Paper uses minimal syntactic filter only

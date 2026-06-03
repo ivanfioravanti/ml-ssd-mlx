@@ -14,8 +14,24 @@ import mlx.core as mx
 from mlx_lm import batch_generate, load
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
+from mlx_lm.utils import sharded_load
 
 Prompt = Union[str, Sequence[int]]
+
+
+def init_mlx_distributed_group(backend: str = "jaccl") -> Any:
+    """Initialize the MLX distributed group used for model-parallel inference."""
+    if backend != "jaccl":
+        raise ValueError("Only the jaccl backend is supported for MLX distributed.")
+    return mx.distributed.init(strict=True, backend=backend)
+
+
+def distributed_barrier(group: Optional[Any]) -> None:
+    """Synchronize distributed ranks when an MLX group is active."""
+    if group is None:
+        return
+    token = mx.distributed.all_sum(mx.array(1, dtype=mx.int32), group=group)
+    mx.eval(token)
 
 
 @dataclass
@@ -63,13 +79,49 @@ class MLXGenerationConfig:
 class MLXTextGenerator:
     """Loads an MLX-LM model and generates text from string or token prompts."""
 
-    def __init__(self, model_name: str, *, trust_remote_code: bool = True):
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        trust_remote_code: bool = True,
+        use_mlx_distributed: bool = False,
+        distributed_backend: str = "jaccl",
+        distributed_group: Optional[Any] = None,
+    ):
         self.model_name = model_name
-        self.model, self.tokenizer = load(
-            path_or_hf_repo=model_name,
-            tokenizer_config={"trust_remote_code": trust_remote_code},
-        )
+        self.distributed_group = None
+        self.distributed_rank = 0
+        self.distributed_world_size = 1
+
+        tokenizer_config = {"trust_remote_code": trust_remote_code}
+        if use_mlx_distributed:
+            self.distributed_group = distributed_group or init_mlx_distributed_group(
+                distributed_backend
+            )
+            self.distributed_rank = self.distributed_group.rank()
+            self.distributed_world_size = self.distributed_group.size()
+            self.model, self.tokenizer = sharded_load(
+                model_name,
+                tensor_group=self.distributed_group,
+                tokenizer_config=tokenizer_config,
+            )
+        else:
+            self.model, self.tokenizer = load(
+                path_or_hf_repo=model_name,
+                tokenizer_config=tokenizer_config,
+            )
         self.last_finish_reasons: List[str] = []
+
+    @property
+    def is_distributed(self) -> bool:
+        return self.distributed_group is not None
+
+    @property
+    def is_rank0(self) -> bool:
+        return self.distributed_rank == 0
+
+    def barrier(self) -> None:
+        distributed_barrier(self.distributed_group)
 
     def generate(
         self,

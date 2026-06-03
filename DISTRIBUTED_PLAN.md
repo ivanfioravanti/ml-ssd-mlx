@@ -5,9 +5,9 @@
 Implement distributed ML-SSD-MLX in two phases.
 
 1. V1 uses data parallelism: each Mac runs the full MLX model on a deterministic shard of prompts or evaluation tasks, then writes shard-local artifacts that are merged into the same files the single-machine pipeline already produces.
-2. V2 investigates true MLX distributed model execution over RDMA-class transport, using MLX distributed collectives only after the data-parallel path is stable and benchmarked.
+2. V2 investigates true MLX distributed model execution over JACCL/Thunderbolt RDMA, using MLX distributed collectives only after the data-parallel path is stable and benchmarked.
 
-For Qwen3-4B, data parallelism is the correct first speedup path because the model already fits on one Apple Silicon machine. RDMA/Thunderbolt should be treated as a transport optimization target, with TCP/MPI fallback required. MLX distributed is MPI-backed, so the MPI implementation and network transport decide whether RDMA is actually used.
+For Qwen3-4B, data parallelism is the correct first speedup path because the model already fits on one Apple Silicon machine. JACCL/Thunderbolt RDMA should be treated as the V2 transport target, not the first production path.
 
 ## Current Pipeline
 
@@ -18,15 +18,20 @@ For Qwen3-4B, data parallelism is the correct first speedup path because the mod
 
 ## V1: Data-Parallel Distributed Pipeline
 
-Add distributed sharding support without changing single-machine behavior.
+Implemented in `data_generation/generate.py` without changing the legacy
+single-machine path. Distributed generation reuses the checkpoint system; each
+worker writes shard-local checkpoint parts, and the merge command rebuilds final
+`train.parquet` / `train.jsonl` from all shards.
 
-New CLI options:
+CLI options:
 
 - `--distributed-shard-index`
 - `--distributed-num-shards`
 - `--distributed-run-id`
 - `--distributed-output-root`
 - `--distributed-merge`
+- `--checkpoint-every`
+- `--resume`
 
 Generation behavior:
 
@@ -129,21 +134,39 @@ The launcher should only compose and run SSH commands. The generation/evaluation
 
 ## V2: MLX Distributed and RDMA Experiment
 
-Use MLX distributed only after V1 is correct and benchmarked.
+Use MLX distributed only after V1 is correct and benchmarked. Initial V2 JACCL
+pipeline support is now present:
+
+- `scripts/mlx_distributed_probe.py` initializes an MLX distributed group,
+  validates `all_sum` / `all_gather`, and times a small all-reduce payload.
+- The same probe can optionally load Qwen3 through
+  `mlx_lm.utils.sharded_load`.
+- `evaluation.MLXTextGenerator` has an explicit `use_mlx_distributed` opt-in
+  that loads with a tensor-parallel group instead of the default local
+  `mlx_lm.load` path.
+- `data_generation/generate.py` exposes `--mlx-distributed` /
+  `--mlx-distributed-backend jaccl`. Every rank participates in generation;
+  rank 0 writes checkpoints, parquet, JSONL, and metadata.
+- `evaluation/eval.py` exposes `--mlx_distributed` /
+  `--mlx_distributed_backend jaccl`. Every rank participates in generation;
+  rank 0 runs correctness tests and writes result JSON.
 
 Transport validation:
 
 - Confirm `mx.distributed.is_available()`.
-- Run `mx.distributed.init()` across 2 Macs.
+- Generate a JACCL hostfile with `mlx.distributed_config --backend jaccl --over thunderbolt`.
+- Ensure every host in the JACCL hostfile has the same checkout path and a working `.venv/bin/python`.
+- Launch probes with explicit `mlx.launch --cwd <repo> --python <repo>/.venv/bin/python`.
+- Run `mx.distributed.init(backend="jaccl")` across 2 Macs.
 - Benchmark `all_gather`, `all_sum`, `send`, and `recv`.
 - Record latency, bandwidth, CPU usage, wall time, and failure modes.
-- Run every benchmark twice: TCP/MPI baseline and RDMA/Thunderbolt target transport, if available.
+- Use JACCL only for V2 benchmarking.
 
 Tensor/model parallel prototype:
 
-- Start with a minimal MLX script that shards synthetic linear layers across hosts.
-- Move to a tiny model before touching Qwen.
-- Only attempt Qwen inference if communication benchmarks show the transport is stable.
+- Run the JACCL probe with a small Qwen generation sample.
+- Run `data_generation/generate.py --mlx-distributed --limit 1 --max-tokens 32`.
+- Run `evaluation/eval.py --mlx_distributed --limit 1 --n_repeat 1 --max_tokens 8 --lcb_data_files test.jsonl --lcb_allow_any_date --lcb_preprocess_num_proc 1`.
 - Compare against V1 data parallel throughput, not just single-request latency.
 
 Acceptance gate:
@@ -207,7 +230,7 @@ Cluster test:
 
 - First implementation targets 2-4 Apple Silicon Macs.
 - V1 data parallelism is the production path for Qwen3-4B.
-- RDMA/Thunderbolt is an optimization target, not a hard dependency.
+- JACCL/Thunderbolt RDMA is the V2 transport target.
 - Single-machine behavior must remain unchanged when distributed flags are omitted.
 - Merged artifacts must stay compatible with the existing training and evaluation pipeline.
 - Full paper-aligned generation uses the deduplicated prompt set, not the full 591K `seed_sft` rows.

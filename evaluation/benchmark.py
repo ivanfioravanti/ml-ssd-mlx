@@ -9,9 +9,10 @@ import os
 import re
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from datasets import Dataset, concatenate_datasets, load_dataset
+from huggingface_hub import hf_hub_download
 
 from evaluation.mlx_generation import MLXGenerationConfig
 from evaluation.livecodebench_utils import (
@@ -49,7 +50,12 @@ def has_code(response):
 
 def filter_by_contest_date(example):
     target_months = ["2025-02", "2025-03", "2025-04", "2025-05"]
-    return example["contest_date"][:7] in target_months
+    contest_date = example["contest_date"]
+    if hasattr(contest_date, "strftime"):
+        month = contest_date.strftime("%Y-%m")
+    else:
+        month = str(contest_date)[:7]
+    return month in target_months
 
 
 class LiveCodeBenchV6:
@@ -71,6 +77,9 @@ class LiveCodeBenchV6:
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
         max_kv_size: Optional[int] = None,
+        lcb_data_files: Optional[List[str]] = None,
+        lcb_filter_contest_date: bool = True,
+        lcb_preprocess_num_proc: Optional[int] = None,
     ):
         self.generator = generator
         self.tokenizer = tokenizer
@@ -88,16 +97,37 @@ class LiveCodeBenchV6:
         self.prefill_batch_size = prefill_batch_size
         self.prefill_step_size = prefill_step_size
         self.max_kv_size = max_kv_size
+        self.lcb_data_files = lcb_data_files
+        self.lcb_filter_contest_date = lcb_filter_contest_date
+        self.lcb_preprocess_num_proc = lcb_preprocess_num_proc
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    def run(self):
+    def run(
+        self,
+        *,
+        run_evaluation: bool = True,
+        before_generate: Optional[Callable[[], None]] = None,
+        after_generate: Optional[Callable[[], None]] = None,
+    ):
         """Run the full benchmark: load data, generate solutions, evaluate."""
         ds = self.load_questions()
         examples = list(ds)
         if self.limit > 0:
             examples = examples[: self.limit]
             self.logger.info(f"Limited evaluation to {len(examples)} problems")
+        if before_generate is not None:
+            before_generate()
         self.generate(examples)
+        if after_generate is not None:
+            after_generate()
+        if not run_evaluation:
+            self.logger.info("Skipping correctness evaluation on this distributed rank")
+            return {
+                "examples": [],
+                "num_total": len(examples),
+                "num_repeat": self.n_repeat,
+                "distributed_worker": True,
+            }
         results = self.evaluate(examples)
         return results
 
@@ -252,6 +282,13 @@ class LiveCodeBenchV6:
         """Evaluate generated solutions using parallel thread execution."""
         self.logger.info(f"Evaluating {len(examples)} examples...")
         self.logger.warning("Expect some output leaks from code/test execution into stdout")
+        if not examples:
+            self.logger.warning("No examples to evaluate.")
+            return {
+                "examples": [],
+                "num_total": 0,
+                "num_repeat": self.n_repeat,
+            }
 
         # Organize completions by repeat index
         examples_by_repeat = defaultdict(list)
@@ -377,19 +414,51 @@ class LiveCodeBenchV6:
     def load_questions(self) -> Dataset:
         """Load LiveCodeBenchV6 questions from HuggingFace."""
         self.logger.info("Loading LiveCodeBenchV6 questions from livecodebench/code_generation_lite...")
-        cpu_count = os.cpu_count()
-        lcb_codegen = load_dataset("livecodebench/code_generation_lite", split="test", trust_remote_code=True)
+        preprocess_num_proc = self.lcb_preprocess_num_proc or os.cpu_count() or 1
+        map_kwargs = {"num_proc": preprocess_num_proc} if preprocess_num_proc > 1 else {}
+        if self.lcb_data_files:
+            self.logger.info(
+                "Using LiveCodeBench data file subset: %s",
+                ", ".join(self.lcb_data_files),
+            )
+            downloaded_files = [
+                hf_hub_download(
+                    repo_id="livecodebench/code_generation_lite",
+                    filename=file_name,
+                    repo_type="dataset",
+                )
+                for file_name in self.lcb_data_files
+            ]
+            lcb_codegen = load_dataset("json", data_files=downloaded_files, split="train")
+        else:
+            lcb_codegen = load_dataset(
+                "livecodebench/code_generation_lite",
+                split="test",
+                trust_remote_code=True,
+            )
         self.logger.info(f"Loaded {len(lcb_codegen)} problems from livecodebench/code_generation_lite")
-        ds = lcb_codegen.filter(filter_by_contest_date)
-        self.logger.info(f"{len(ds)} problems after date filter (Feb-May 2025)")
+        if self.lcb_filter_contest_date:
+            ds = lcb_codegen.filter(filter_by_contest_date)
+            self.logger.info(f"{len(ds)} problems after date filter (Feb-May 2025)")
+        else:
+            ds = lcb_codegen
+            self.logger.info("Skipping contest-date filter")
+
+        if self.limit > 0:
+            ds = ds.select(range(min(self.limit, len(ds))))
+            self.logger.info("Limited preprocessing to %s problems", len(ds))
+        if len(ds) == 0:
+            return ds
+
         # Avoids "pyarrow.lib.ArrowInvalid: offset overflow while concatenating arrays" when mapping
+        self.logger.info("Preprocessing with num_proc=%s", preprocess_num_proc)
         processed_shards = []
-        num_shards = 4
+        num_shards = min(4, max(len(ds), 1))
         for i in range(num_shards):
             shard = ds.shard(num_shards=num_shards, index=i)
             shard = shard.map(
                 lambda example: {"private_test_cases": translate_private_test_cases(example["private_test_cases"])},
-                num_proc=cpu_count,
+                **map_kwargs,
             )
             shard = shard.map(map_to_example, remove_columns=ds.column_names, load_from_cache_file=False)
             processed_shards.append(shard)

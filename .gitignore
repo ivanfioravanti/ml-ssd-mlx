@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+models/
+output/
+results/
+
+generation*.log
+hosts-*.json
